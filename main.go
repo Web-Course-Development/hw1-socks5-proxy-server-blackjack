@@ -13,353 +13,334 @@ import (
 	"syscall"
 )
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-// Auth methods (RFC 1928 §3)
+// no auth = 0x00, user/pass = 0x02, nothing works = 0xFF
 const (
-	methodNoAuth       byte = 0x00
-	methodUserPass     byte = 0x02
-	methodNoAcceptable byte = 0xFF
+	noAuth    byte = 0x00
+	userPass  byte = 0x02
+	noMethods byte = 0xFF
 )
 
-// SOCKS5 protocol constants
+// socks5 version is always 5, and we only support CONNECT command
 const (
-	socks5Ver  = byte(0x05)
+	version    = byte(0x05)
 	cmdConnect = byte(0x01)
 )
 
-// Address types
+// address types the client can send us
 const (
-	atypIPv4   = byte(0x01)
-	atypDomain = byte(0x03)
+	ipv4Addr   = byte(0x01)
+	domainAddr = byte(0x03)
 )
 
-// Reply codes (RFC 1928 §6)
+// reply codes we send back to the client
 const (
-	repSuccess          = byte(0x00)
-	repFailure          = byte(0x01)
-	repNetUnreachable   = byte(0x03)
-	repHostUnreachable  = byte(0x04)
-	repRefused          = byte(0x05)
-	repCmdNotSupported  = byte(0x07)
-	repAddrNotSupported = byte(0x08)
+	replyOK          = byte(0x00)
+	replyFail        = byte(0x01)
+	replyNetUnreach  = byte(0x03)
+	replyHostUnreach = byte(0x04)
+	replyConnRefused = byte(0x05)
+	replyCmdUnknown  = byte(0x07)
+	replyAddrUnknown = byte(0x08)
 )
-
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
 
 func main() {
-	port := flag.Int("port", 1080, "port to listen on")
+	port := flag.Int("port", 1080, "which port to run on")
 	flag.Parse()
 
 	addr := fmt.Sprintf(":%d", *port)
-	listener, err := net.Listen("tcp", addr)
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		log.Fatalf("listen %s: %v", addr, err)
+		log.Fatalf("could not start listener: %v", err)
 	}
-	defer listener.Close()
-	log.Printf("SOCKS5 proxy listening on %s (auth=%v)", addr, proxyUser() != "")
+	defer ln.Close()
+
+	log.Printf("proxy is up on %s (needs auth: %v)", addr, getUser() != "")
 
 	for {
-		conn, err := listener.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
-			log.Printf("accept: %v", err)
+			log.Printf("accept failed: %v", err)
 			continue
 		}
-		go handleConnection(conn)
+		go handleClient(conn)
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Credential helpers  (read once per call so tests can set env at any time)
-// ---------------------------------------------------------------------------
+// read credentials from environment each time so tests can change them
+func getUser() string { return os.Getenv("PROXY_USER") }
+func getPass() string { return os.Getenv("PROXY_PASS") }
 
-func proxyUser() string { return os.Getenv("PROXY_USER") }
-func proxyPass() string { return os.Getenv("PROXY_PASS") }
-
-// ---------------------------------------------------------------------------
-// Connection handler
-// ---------------------------------------------------------------------------
-
-func handleConnection(conn net.Conn) {
+// handleClient runs the full socks5 flow for one connection
+func handleClient(conn net.Conn) {
 	defer conn.Close()
 
-	method, err := negotiateAuth(conn)
+	// step 1 - figure out which auth method to use
+	method, err := doMethodSelect(conn)
 	if err != nil {
-		log.Printf("[%s] negotiateAuth: %v", conn.RemoteAddr(), err)
+		log.Printf("[%s] method select failed: %v", conn.RemoteAddr(), err)
 		return
 	}
 
-	if method == methodUserPass {
-		if err := authenticateUserPass(conn); err != nil {
-			log.Printf("[%s] authenticateUserPass: %v", conn.RemoteAddr(), err)
+	// step 2 - if we picked user/pass, verify the credentials
+	if method == userPass {
+		if err := checkCredentials(conn); err != nil {
+			log.Printf("[%s] auth failed: %v", conn.RemoteAddr(), err)
 			return
 		}
 	}
 
-	if err := handleConnect(conn); err != nil {
-		log.Printf("[%s] handleConnect: %v", conn.RemoteAddr(), err)
+	// step 3 - handle the actual CONNECT and start relaying
+	if err := doConnect(conn); err != nil {
+		log.Printf("[%s] connect failed: %v", conn.RemoteAddr(), err)
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Step 1 — Method negotiation (RFC 1928 §3)
-// ---------------------------------------------------------------------------
-
-// negotiateAuth reads the client greeting and writes the chosen method.
-// Returns the selected method byte, or an error if negotiation failed.
-func negotiateAuth(conn net.Conn) (byte, error) {
-	// VER | NMETHODS
-	hdr := make([]byte, 2)
-	if _, err := io.ReadFull(conn, hdr); err != nil {
-		return 0, fmt.Errorf("read greeting header: %w", err)
-	}
-	if hdr[0] != socks5Ver {
-		return 0, fmt.Errorf("unsupported SOCKS version 0x%02x", hdr[0])
+// doMethodSelect reads what methods the client supports and picks one
+func doMethodSelect(conn net.Conn) (byte, error) {
+	// first two bytes are version + number of methods
+	buf := make([]byte, 2)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return 0, fmt.Errorf("could not read greeting: %w", err)
 	}
 
-	nmethods := int(hdr[1])
-	methods := make([]byte, nmethods)
-	if _, err := io.ReadFull(conn, methods); err != nil {
-		return 0, fmt.Errorf("read methods: %w", err)
+	if buf[0] != version {
+		return 0, fmt.Errorf("wrong socks version: 0x%02x", buf[0])
 	}
 
-	authRequired := proxyUser() != ""
-	chosen := methodNoAcceptable
+	// read all the methods the client is offering
+	numMethods := int(buf[1])
+	offered := make([]byte, numMethods)
+	if _, err := io.ReadFull(conn, offered); err != nil {
+		return 0, fmt.Errorf("could not read method list: %w", err)
+	}
 
-	if authRequired {
-		for _, m := range methods {
-			if m == methodUserPass {
-				chosen = methodUserPass
+	needsAuth := getUser() != ""
+	picked := noMethods
+
+	if needsAuth {
+		// look for user/pass method
+		for _, m := range offered {
+			if m == userPass {
+				picked = userPass
 				break
 			}
 		}
 	} else {
-		for _, m := range methods {
-			if m == methodNoAuth {
-				chosen = methodNoAuth
+		// look for no-auth method
+		for _, m := range offered {
+			if m == noAuth {
+				picked = noAuth
 				break
 			}
 		}
 	}
 
-	// Always send the method selection, even 0xFF
-	if _, err := conn.Write([]byte{socks5Ver, chosen}); err != nil {
-		return 0, fmt.Errorf("write method selection: %w", err)
+	// tell client which method we chose (even if it's 0xFF = none)
+	if _, err := conn.Write([]byte{version, picked}); err != nil {
+		return 0, fmt.Errorf("could not send method choice: %w", err)
 	}
-	if chosen == methodNoAcceptable {
-		return 0, fmt.Errorf("no acceptable auth method offered by client")
+
+	if picked == noMethods {
+		return 0, fmt.Errorf("client did not offer any method we support")
 	}
-	return chosen, nil
+
+	return picked, nil
 }
 
-// ---------------------------------------------------------------------------
-// Step 2 — Username/password sub-negotiation (RFC 1929)
-// ---------------------------------------------------------------------------
-
-// authenticateUserPass handles the RFC 1929 sub-protocol.
-// NOTE: the version byte here is 0x01, NOT 0x05.
-func authenticateUserPass(conn net.Conn) error {
-	// VER(0x01) | ULEN
-	hdr := make([]byte, 2)
-	if _, err := io.ReadFull(conn, hdr); err != nil {
-		return fmt.Errorf("read userpass header: %w", err)
-	}
-	if hdr[0] != 0x01 {
-		return fmt.Errorf("unexpected userpass VER 0x%02x (want 0x01)", hdr[0])
+// checkCredentials does the RFC 1929 username/password check
+// note: this sub-protocol uses version 0x01 not 0x05
+func checkCredentials(conn net.Conn) error {
+	// read version byte (must be 0x01) and username length
+	buf := make([]byte, 2)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return fmt.Errorf("could not read auth header: %w", err)
 	}
 
-	uname := make([]byte, int(hdr[1]))
-	if _, err := io.ReadFull(conn, uname); err != nil {
-		return fmt.Errorf("read username: %w", err)
+	if buf[0] != 0x01 {
+		return fmt.Errorf("bad auth version 0x%02x, expected 0x01", buf[0])
 	}
 
-	// PLEN | PASSWD
-	plenBuf := make([]byte, 1)
-	if _, err := io.ReadFull(conn, plenBuf); err != nil {
-		return fmt.Errorf("read plen: %w", err)
-	}
-	passwd := make([]byte, int(plenBuf[0]))
-	if _, err := io.ReadFull(conn, passwd); err != nil {
-		return fmt.Errorf("read password: %w", err)
+	// read the username
+	username := make([]byte, int(buf[1]))
+	if _, err := io.ReadFull(conn, username); err != nil {
+		return fmt.Errorf("could not read username: %w", err)
 	}
 
-	if string(uname) == proxyUser() && string(passwd) == proxyPass() {
-		_, err := conn.Write([]byte{0x01, 0x00}) // success
+	// read password length then password
+	plen := make([]byte, 1)
+	if _, err := io.ReadFull(conn, plen); err != nil {
+		return fmt.Errorf("could not read password length: %w", err)
+	}
+	password := make([]byte, int(plen[0]))
+	if _, err := io.ReadFull(conn, password); err != nil {
+		return fmt.Errorf("could not read password: %w", err)
+	}
+
+	// check if credentials match
+	if string(username) == getUser() && string(password) == getPass() {
+		_, err := conn.Write([]byte{0x01, 0x00}) // 0x00 = success
 		return err
 	}
 
-	// Send failure status (non-zero) before returning
+	// wrong credentials - send failure then bail
 	conn.Write([]byte{0x01, 0x01}) //nolint:errcheck
-	return fmt.Errorf("invalid credentials for user %q", string(uname))
+	return fmt.Errorf("wrong credentials for user %q", string(username))
 }
 
-// ---------------------------------------------------------------------------
-// Step 3 — CONNECT request + relay (RFC 1928 §4, §5, §6)
-// ---------------------------------------------------------------------------
-
-// handleConnect reads the CONNECT request, dials the target, sends the reply,
-// and relays data bidirectionally.
-func handleConnect(conn net.Conn) error {
-	// VER | CMD | RSV | ATYP
+// doConnect reads the CONNECT request, dials the target, and starts the relay
+func doConnect(conn net.Conn) error {
+	// read the 4 byte request header: VER CMD RSV ATYP
 	hdr := make([]byte, 4)
 	if _, err := io.ReadFull(conn, hdr); err != nil {
-		return fmt.Errorf("read request header: %w", err)
+		return fmt.Errorf("could not read request header: %w", err)
 	}
-	if hdr[0] != socks5Ver {
-		return fmt.Errorf("unexpected request VER 0x%02x", hdr[0])
-	}
-	if hdr[1] != cmdConnect {
-		sendReply(conn, repCmdNotSupported)
-		return fmt.Errorf("unsupported CMD 0x%02x", hdr[1])
-	}
-	// hdr[2] is RSV — ignore per spec
 
-	targetHost, err := readAddress(conn, hdr[3])
+	if hdr[0] != version {
+		return fmt.Errorf("wrong version in request: 0x%02x", hdr[0])
+	}
+
+	// we only support CONNECT, reject anything else
+	if hdr[1] != cmdConnect {
+		writeReply(conn, replyCmdUnknown)
+		return fmt.Errorf("command 0x%02x is not supported", hdr[1])
+	}
+
+	// hdr[2] is reserved, ignore it
+	// hdr[3] is the address type
+	host, err := parseAddress(conn, hdr[3])
 	if err != nil {
-		if err == errAddrType {
-			sendReply(conn, repAddrNotSupported)
+		if err == errBadAddrType {
+			writeReply(conn, replyAddrUnknown)
 		} else {
-			sendReply(conn, repFailure)
+			writeReply(conn, replyFail)
 		}
 		return err
 	}
 
-	// DST.PORT — big-endian uint16
-	portBuf := make([]byte, 2)
-	if _, err := io.ReadFull(conn, portBuf); err != nil {
-		sendReply(conn, repFailure)
-		return fmt.Errorf("read port: %w", err)
+	// read the 2 byte port (big endian)
+	portBytes := make([]byte, 2)
+	if _, err := io.ReadFull(conn, portBytes); err != nil {
+		writeReply(conn, replyFail)
+		return fmt.Errorf("could not read port: %w", err)
 	}
-	port := binary.BigEndian.Uint16(portBuf)
-	targetAddr := fmt.Sprintf("%s:%d", targetHost, port)
+	port := binary.BigEndian.Uint16(portBytes)
+	destination := fmt.Sprintf("%s:%d", host, port)
 
-	// Dial the target
-	target, err := net.Dial("tcp", targetAddr)
+	// try to connect to the target server
+	remote, err := net.Dial("tcp", destination)
 	if err != nil {
-		sendReply(conn, dialErrToRep(err))
-		return fmt.Errorf("dial %s: %w", targetAddr, err)
+		writeReply(conn, mapDialError(err))
+		return fmt.Errorf("could not reach %s: %w", destination, err)
 	}
-	defer target.Close()
+	defer remote.Close()
 
-	// Successful connection — send success reply
-	sendReply(conn, repSuccess)
+	// tell client we connected successfully
+	writeReply(conn, replyOK)
 
-	// Bidirectional relay
-	relay(conn, target)
+	// now just pipe data back and forth until done
+	pipeData(conn, remote)
 	return nil
 }
 
-// errAddrType is a sentinel for unsupported ATYP.
-var errAddrType = errors.New("unsupported address type")
+// errBadAddrType is returned when the client sends an address type we don't know
+var errBadAddrType = errors.New("address type not supported")
 
-// readAddress reads DST.ADDR based on the given ATYP byte.
-func readAddress(conn net.Conn, atyp byte) (string, error) {
-	switch atyp {
-	case atypIPv4:
-		buf := make([]byte, 4)
-		if _, err := io.ReadFull(conn, buf); err != nil {
-			return "", fmt.Errorf("read IPv4: %w", err)
+// parseAddress reads the destination address from the connection
+func parseAddress(conn net.Conn, addrType byte) (string, error) {
+	switch addrType {
+
+	case ipv4Addr:
+		// IPv4 is just 4 raw bytes
+		ip := make([]byte, 4)
+		if _, err := io.ReadFull(conn, ip); err != nil {
+			return "", fmt.Errorf("could not read ipv4 address: %w", err)
 		}
-		return net.IP(buf).String(), nil
+		return net.IP(ip).String(), nil
 
-	case atypDomain:
+	case domainAddr:
+		// domain name: first byte is the length, then that many bytes
 		lenBuf := make([]byte, 1)
 		if _, err := io.ReadFull(conn, lenBuf); err != nil {
-			return "", fmt.Errorf("read domain length: %w", err)
+			return "", fmt.Errorf("could not read domain length: %w", err)
 		}
-		domain := make([]byte, int(lenBuf[0]))
-		if _, err := io.ReadFull(conn, domain); err != nil {
-			return "", fmt.Errorf("read domain: %w", err)
+		name := make([]byte, int(lenBuf[0]))
+		if _, err := io.ReadFull(conn, name); err != nil {
+			return "", fmt.Errorf("could not read domain name: %w", err)
 		}
-		return string(domain), nil
+		return string(name), nil
 
 	default:
-		return "", errAddrType
+		return "", errBadAddrType
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Reply helper
-// ---------------------------------------------------------------------------
-
-// sendReply writes a SOCKS5 reply with the given REP code.
-// BND.ADDR = 0.0.0.0, BND.PORT = 0 (valid per RFC 1928 §6).
-func sendReply(conn net.Conn, rep byte) {
+// writeReply sends a socks5 reply back to the client
+// we always use 0.0.0.0:0 as the bound address since we don't need it
+func writeReply(conn net.Conn, code byte) {
 	conn.Write([]byte{ //nolint:errcheck
-		socks5Ver, rep, 0x00, // VER REP RSV
-		atypIPv4,               // ATYP = IPv4
-		0x00, 0x00, 0x00, 0x00, // BND.ADDR
-		0x00, 0x00, // BND.PORT
+		version, code, 0x00, // VER REP RSV
+		ipv4Addr,               // ATYP
+		0x00, 0x00, 0x00, 0x00, // BND.ADDR (all zeros)
+		0x00, 0x00, // BND.PORT (zero)
 	})
 }
 
-// ---------------------------------------------------------------------------
-// Bidirectional relay
-// ---------------------------------------------------------------------------
-
-// relay copies data between client and target concurrently in both directions.
-// Uses sync.WaitGroup and CloseWrite so both sides receive proper EOF.
-func relay(client, target net.Conn) {
+// pipeData copies data between client and remote in both directions at the same time
+func pipeData(client, remote net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// client → target
+	// client sends data to remote
 	go func() {
 		defer wg.Done()
-		io.Copy(target, client) //nolint:errcheck
-		closeWrite(target)
+		io.Copy(remote, client) //nolint:errcheck
+		halfClose(remote)
 	}()
 
-	// target → client
+	// remote sends data back to client
 	go func() {
 		defer wg.Done()
-		io.Copy(client, target) //nolint:errcheck
-		closeWrite(client)
+		io.Copy(client, remote) //nolint:errcheck
+		halfClose(client)
 	}()
 
 	wg.Wait()
 }
 
-// closeWrite calls CloseWrite on TCP connections to signal EOF to the peer.
-func closeWrite(conn net.Conn) {
+// halfClose signals EOF in one direction without closing the whole connection
+func halfClose(conn net.Conn) {
 	if tc, ok := conn.(*net.TCPConn); ok {
 		tc.CloseWrite() //nolint:errcheck
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Error → REP code mapping
-// ---------------------------------------------------------------------------
-
-// dialErrToRep converts a net.Dial error into the appropriate SOCKS5 REP byte.
-func dialErrToRep(err error) byte {
+// mapDialError converts a connection error into the right socks5 reply code
+func mapDialError(err error) byte {
 	if err == nil {
-		return repSuccess
+		return replyOK
 	}
+
 	var opErr *net.OpError
 	if errors.As(err, &opErr) {
-		var syscallErr *os.SyscallError
-		if errors.As(opErr.Err, &syscallErr) {
-			errno, ok := syscallErr.Err.(syscall.Errno)
+		var sysErr *os.SyscallError
+		if errors.As(opErr.Err, &sysErr) {
+			errno, ok := sysErr.Err.(syscall.Errno)
 			if ok {
 				switch errno {
 				case syscall.ECONNREFUSED:
-					return repRefused
+					return replyConnRefused
 				case syscall.ENETUNREACH:
-					return repNetUnreachable
+					return replyNetUnreach
 				case syscall.EHOSTUNREACH, syscall.ETIMEDOUT:
-					return repHostUnreachable
+					return replyHostUnreach
 				}
 			}
 		}
-		// DNS / lookup failures → host unreachable
+		// DNS failures and other dial errors -> host unreachable
 		if opErr.Op == "dial" || opErr.Op == "lookup" {
-			return repHostUnreachable
+			return replyHostUnreach
 		}
 	}
-	return repFailure
+
+	return replyFail
 }
